@@ -52,7 +52,7 @@ def split_features_target(
 
 def get_feature_groups(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
     """Return explicit numeric and categorical feature lists when available."""
-    numeric_columns = ["age", "bmi", "children", "charges"]
+    numeric_columns = ["age", "bmi", "children"]
     categorical_columns = ["sex", "smoker", "region"]
 
     if set(numeric_columns + categorical_columns).issubset(df.columns):

@@ -1,7 +1,9 @@
 import json
 import logging
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import joblib
 from sklearn.ensemble import RandomForestClassifier
@@ -11,6 +13,7 @@ from app.core.evaluate import evaluate_model
 
 logger = logging.getLogger(__name__)
 
+# ─── Path Helpers ──────────────────────────────────────────────────────────────
 
 def get_model_root_folder() -> Path:
     """Return the root model folder under backend/model."""
@@ -38,6 +41,13 @@ def get_feature_columns_path(folder: Path = None, filename: str = "feature_colum
     return folder / filename
 
 
+def get_version_history_path(folder: Path = None) -> Path:
+    folder = folder or get_model_root_folder()
+    return folder / "version_history.json"
+
+
+# ─── Artifact I/O ─────────────────────────────────────────────────────────────
+
 def save_feature_columns(feature_columns: List[str], folder: Path = None, filename: str = "feature_columns.json") -> Path:
     folder = folder or get_model_root_folder()
     folder.mkdir(parents=True, exist_ok=True)
@@ -58,12 +68,13 @@ def load_feature_columns(folder: Path = None, filename: str = "feature_columns.j
 
 
 def save_metadata(metadata: Dict[str, Any], folder: Path = None, filename: str = "metadata.json") -> Path:
+    """Save extended metadata including all ML metrics, timestamps, and version info."""
     folder = folder or get_model_root_folder()
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / filename
     logger.info("Saving model metadata to %s", path)
     with open(path, "w", encoding="utf-8") as handle:
-        json.dump(metadata, handle)
+        json.dump(metadata, handle, indent=2, default=str)
     return path
 
 
@@ -93,12 +104,40 @@ def load_pipeline(folder: Path = None, filename: str = "preprocessing_pipeline.p
     return joblib.load(path)
 
 
-def build_classifiers(random_state: int = 42) -> Dict[str, Any]:
-    """Create the classifier objects used for training.
+# ─── Version History ──────────────────────────────────────────────────────────
 
-    Logistic Regression is a strong baseline for binary insurance decisions because it is
-    interpretable and fast. Random Forest is added for robustness and nonlinear feature
-    interactions, which often improve classification on tabular claim data.
+def load_version_history(folder: Path = None) -> List[Dict[str, Any]]:
+    """Load the model version history (retraining audit trail)."""
+    path = get_version_history_path(folder)
+    if not path.exists():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def append_version_history(entry: Dict[str, Any], folder: Path = None) -> None:
+    """Append a new version record to the version history file."""
+    folder = folder or get_model_root_folder()
+    folder.mkdir(parents=True, exist_ok=True)
+    history = load_version_history(folder)
+    history.append(entry)
+    path = get_version_history_path(folder)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2, default=str)
+    logger.info("Appended version record %s to history", entry.get("version"))
+
+
+# ─── Model Building ───────────────────────────────────────────────────────────
+
+def build_classifiers(random_state: int = 42) -> Dict[str, Any]:
+    """
+    Create the classifier objects for training.
+
+    Logistic Regression is a strong, interpretable baseline.
+    Random Forest handles nonlinear feature interactions in tabular claim data.
     """
     return {
         "logistic_regression": LogisticRegression(
@@ -108,27 +147,25 @@ def build_classifiers(random_state: int = 42) -> Dict[str, Any]:
             n_estimators=200,
             random_state=random_state,
             n_jobs=-1,
+            class_weight="balanced",
         ),
     }
 
 
 def train_models(X_train, y_train, random_state: int = 42) -> Dict[str, Any]:
-    """Train both logistic regression and random forest models."""
+    """Train both classifier models and return them."""
     models = build_classifiers(random_state=random_state)
-
     for model_name, model in models.items():
         logger.info("Training %s", model_name)
         model.fit(X_train, y_train)
         logger.info("Finished training %s", model_name)
-
     return models
 
 
 def save_model(model: Any, name: str, folder: Path = None, extension: str = "joblib") -> Path:
-    """Save a trained model object to disk with a configurable extension."""
+    """Save a trained model object to disk."""
     folder = folder or get_artifacts_folder()
     folder.mkdir(parents=True, exist_ok=True)
-
     model_path = folder / f"{name}.{extension}"
     logger.info("Saving model %s to %s", name, model_path)
     joblib.dump(model, model_path)
@@ -139,7 +176,6 @@ def save_pipeline(pipeline: Any, folder: Path = None, filename: str = "preproces
     """Save the preprocessing pipeline used for feature transformation."""
     folder = folder or get_model_root_folder()
     folder.mkdir(parents=True, exist_ok=True)
-
     pipeline_path = folder / filename
     logger.info("Saving preprocessing pipeline to %s", pipeline_path)
     joblib.dump(pipeline, pipeline_path)
@@ -155,7 +191,6 @@ def select_best_model(metrics: Dict[str, Dict[str, Any]]) -> str:
     for model_name, values in metrics.items():
         f1 = float(values.get("f1_score", 0.0))
         accuracy = float(values.get("accuracy", 0.0))
-
         if f1 > best_f1 or (f1 == best_f1 and accuracy > best_accuracy):
             best_name = model_name
             best_f1 = f1
@@ -166,19 +201,24 @@ def select_best_model(metrics: Dict[str, Dict[str, Any]]) -> str:
 
     logger.info(
         "Selected best model '%s' with f1_score=%s and accuracy=%s",
-        best_name,
-        best_f1,
-        best_accuracy,
+        best_name, best_f1, best_accuracy,
     )
     return best_name
 
 
+# ─── Full Training Orchestrator ───────────────────────────────────────────────
+
 def train_and_select_best_model(
     X_train, X_test, y_train, y_test, random_state: int = 42
 ) -> Dict[str, Any]:
-    """Train both models, compare them on standard metrics, and save the best model."""
+    """
+    Train both models, compare on standard metrics, save the best, and return
+    a full result dict including per-model metrics and timing.
+    """
+    training_start = time.perf_counter()
+
     models = train_models(X_train, y_train, random_state=random_state)
-    metrics = {}
+    metrics: Dict[str, Dict[str, Any]] = {}
 
     for model_name, model in models.items():
         metrics[model_name] = evaluate_model(model, X_test, y_test)
@@ -186,9 +226,21 @@ def train_and_select_best_model(
     best_model_name = select_best_model(metrics)
     best_model = models[best_model_name]
 
-    # Save the selected best model to the required backend/model path.
+    # ── Inference latency sample (average over 50 predictions on test set) ─────
+    import numpy as np
+    sample_size = min(50, X_test.shape[0])
+    sample_X = X_test[:sample_size] if isinstance(X_test, np.ndarray) else X_test[:sample_size]
+    lat_start = time.perf_counter()
+    for _ in range(sample_size):
+        best_model.predict(sample_X[:1])
+    lat_end = time.perf_counter()
+    avg_latency_ms = round(((lat_end - lat_start) / sample_size) * 1000, 2)
+
+    training_end = time.perf_counter()
+    duration_s = round(training_end - training_start, 2)
+
+    # ── Persist best model ────────────────────────────────────────────────────
     save_model(best_model, "best_model", folder=get_model_root_folder(), extension="pkl")
-    # Also preserve each trained model variant in artifacts for future analysis.
     for model_name, model in models.items():
         save_model(model, model_name)
 
@@ -196,4 +248,44 @@ def train_and_select_best_model(
         "models": models,
         "metrics": metrics,
         "best_model_name": best_model_name,
+        "inference_latency_ms": avg_latency_ms,
+        "training_duration_s": duration_s,
     }
+
+
+# ─── Artifact Validation ──────────────────────────────────────────────────────
+
+REQUIRED_ARTIFACTS = [
+    "best_model.pkl",
+    "preprocessing_pipeline.pkl",
+    "metadata.json",
+    "feature_columns.json",
+]
+
+
+def artifacts_exist(folder: Optional[Path] = None) -> bool:
+    """Return True only if all required model artifacts are present."""
+    root = folder or get_model_root_folder()
+    for artifact in REQUIRED_ARTIFACTS:
+        if not (root / artifact).exists():
+            logger.info("Missing artifact: %s", artifact)
+            return False
+    return True
+
+
+def validate_metadata(folder: Optional[Path] = None) -> bool:
+    """
+    Validate that metadata.json contains the required fields.
+    Returns False if the file is missing, corrupted, or incomplete.
+    """
+    try:
+        meta = load_metadata(folder)
+        required_keys = {"best_model_name", "feature_columns", "trained_models", "accuracy"}
+        missing = required_keys - set(meta.keys())
+        if missing:
+            logger.warning("Metadata missing required keys: %s", missing)
+            return False
+        return True
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+        logger.warning("Metadata validation failed: %s", exc)
+        return False

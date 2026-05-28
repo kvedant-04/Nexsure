@@ -1,4 +1,4 @@
-// File: D:\InsuranceWala\frontend\app\predict\page.tsx
+// File: D:\InsuranceWalla\frontend\app\predict\page.tsx
 import * as entry from '../../../../app/predict/page.js'
 import type { ResolvingMetadata, ResolvingViewport } from 'next/dist/lib/metadata/types/metadata-interface.js'
 

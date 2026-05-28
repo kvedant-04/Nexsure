@@ -16,10 +16,10 @@
       "static/chunks/main-app.js",
       "static/chunks/app/predict/page.js"
     ],
-    "/not-found": [
+    "/dashboard/page": [
       "static/chunks/webpack.js",
       "static/chunks/main-app.js",
-      "static/chunks/app/not-found.js"
+      "static/chunks/app/dashboard/page.js"
     ]
   }
 }
