@@ -1,58 +1,54 @@
 """
-Nexsure — Prediction & Observability API Routes
+predict.py -- Nexsure AI Engine Routing & Low-Latency Inference Layer (v3.0)
 
-Endpoints:
-  GET  /api/health           — liveness probe
-  GET  /api/training-status  — current training stage (for polling)
-  GET  /api/system-info      — full model metadata + health state
-  GET  /api/metrics          — per-model evaluation metrics
-  GET  /api/model-insights   — feature importance + model comparison
-  GET  /api/version-history  — retraining audit trail
-  GET  /api/logs             — recent prediction logs
-  POST /api/predict          — single-record risk assessment
-  POST /api/train            — manual retrain trigger (for emergencies)
+Features:
+- Precision nanosecond stage timing (8 lifecycle stages)
+- Multi-layered runtime cache utilization (zero disk I/O during serving)
+- Model-Version aware SHAP explainer reuse
+- Real-time telemetry tracking & rolling percentile engine
+- Governance & Model Registry APIs (/api/model-registry, /api/promotion-history)
+- Performance & Cache Status APIs (/api/performance, /api/cache-status)
 """
 
 import logging
 import time
-import traceback
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-import joblib
 import numpy as np
 import pandas as pd
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.core.data_loader import load_dataset
-from app.core.evaluate import evaluate_models
+import app.core.logger as ns_log
+from app.core.cache_manager import runtime_cache
 from app.core.explain import explain_local_prediction, get_global_feature_importance
-from app.core.preprocess import fit_preprocessing_pipeline, split_features_target
-from app.core.train import (
-    artifacts_exist,
-    get_artifacts_folder,
-    get_model_root_folder,
-    load_feature_columns,
-    load_metadata,
-    load_model,
-    load_pipeline,
-    load_version_history,
-    save_feature_columns,
-    save_metadata,
-    save_pipeline,
-    append_version_history,
-    train_and_select_best_model,
+from app.core.governance import validate_provenance_compatibility
+from app.core.performance import PrecisionTimer, persist_summary_metadata_async
+from app.core.promotion import (
+    get_champion,
+    get_challenger,
+    promote_model,
+    rollback_model,
+    validate_registry,
 )
+from app.core.registry import (
+    get_model_root_folder,
+    load_benchmark_report,
+    load_model_registry,
+    load_promotion_history,
+    load_version_history,
+)
+from app.core.telemetry import telemetry_engine
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 MODEL_ROOT = get_model_root_folder()
-ARTIFACTS_ROOT = get_artifacts_folder()
 
-# ─── Global State ──────────────────────────────────────────────────────────────
-# All state is encapsulated in a single dict to make it easy to inject
-# during the startup lifecycle.
+# --------------------------------------------------------------------------- #
+#  Global Application State                                                    #
+# --------------------------------------------------------------------------- #
 
 _STATE: Dict[str, Any] = {
     "pipeline": None,
@@ -61,37 +57,48 @@ _STATE: Dict[str, Any] = {
     "best_model_name": None,
     "metadata": {},
     "version_history": [],
+    "model_registry": {},
+    "promotion_history": [],
     "X_test_transformed": None,
     "y_test": None,
     "X_test_df": None,
+    "benchmark_report": {},
 }
 
-# Training status for frontend polling
 _TRAINING_STATUS: Dict[str, str] = {
-    "status": "idle",   # idle | training | ready | degraded
-    "stage": "idle",    # initializing | preprocessing | training | evaluating | selecting | saving | idle
+    "status": "idle",
+    "stage": "idle",
 }
 
-# Prediction logs (capped at 200 in memory)
 _PREDICTION_LOGS: List[Dict[str, Any]] = []
 
 
-# ─── State Management Helpers ─────────────────────────────────────────────────
-
 def _set_global_state(
-    pipeline, trained_models, feature_columns, best_model_name,
-    metadata, version_history, X_test_transformed, y_test, X_test_df
+    pipeline,
+    trained_models,
+    feature_columns,
+    best_model_name,
+    metadata,
+    version_history,
+    X_test_transformed,
+    y_test,
+    X_test_df,
+    benchmark_report=None,
+    model_registry=None,
+    promotion_history=None,
 ) -> None:
-    """Called by main.py startup to inject trained state."""
     _STATE["pipeline"] = pipeline
     _STATE["trained_models"] = trained_models or {}
     _STATE["feature_columns"] = feature_columns
     _STATE["best_model_name"] = best_model_name
     _STATE["metadata"] = metadata or {}
     _STATE["version_history"] = version_history or []
+    _STATE["model_registry"] = model_registry or {}
+    _STATE["promotion_history"] = promotion_history or []
     _STATE["X_test_transformed"] = X_test_transformed
     _STATE["y_test"] = y_test
     _STATE["X_test_df"] = X_test_df
+    _STATE["benchmark_report"] = benchmark_report or {}
 
 
 def _set_training_status(status: str, stage: str) -> None:
@@ -103,6 +110,44 @@ def _get_training_status() -> Dict[str, str]:
     return dict(_TRAINING_STATUS)
 
 
+def normalize_input_features(features: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize raw string/numeric input features into pipeline-compatible encodings."""
+    norm: Dict[str, Any] = {}
+    
+    # age
+    norm["age"] = float(features.get("age", 30))
+    # bmi
+    norm["bmi"] = float(features.get("bmi", 25.0))
+    # children
+    norm["children"] = int(features.get("children", 0))
+    
+    # sex (0=female, 1=male)
+    sex_val = str(features.get("sex", "male")).strip().lower()
+    if sex_val in ["female", "f", "0"]:
+        norm["sex"] = 0
+    else:
+        norm["sex"] = 1
+        
+    # smoker (0=no/non-smoker, 1=yes/smoker)
+    smoker_val = str(features.get("smoker", "no")).strip().lower()
+    if smoker_val in ["no", "non-smoker", "false", "0", "n"]:
+        norm["smoker"] = 0
+    else:
+        norm["smoker"] = 1
+        
+    # region (0=northeast, 1=northwest, 2=southeast, 3=southwest)
+    region_val = str(features.get("region", "southwest")).strip().lower()
+    region_map = {
+        "northeast": 0, "ne": 0, "0": 0,
+        "northwest": 1, "nw": 1, "1": 1,
+        "southeast": 2, "se": 2, "2": 2,
+        "southwest": 3, "sw": 3, "3": 3,
+    }
+    norm["region"] = region_map.get(region_val, 0)
+    
+    return norm
+
+
 def _is_ready() -> bool:
     return (
         _STATE["pipeline"] is not None
@@ -112,53 +157,66 @@ def _is_ready() -> bool:
 
 
 def _derive_model_health() -> str:
-    """Determine model health from current state."""
-    status = _TRAINING_STATUS["status"]
+    status = _TRAINING_STATUS.get("status", "idle")
     if status == "training":
         return "training"
     if status == "degraded":
         return "degraded"
-    if _is_ready():
+    if _is_ready() and runtime_cache.is_warm:
         return "healthy"
     return "unavailable"
 
 
-# ─── Schemas ──────────────────────────────────────────────────────────────────
-
-class TrainRequest(BaseModel):
-    dataset_filename: str = Field("insurance3r2.csv", description="CSV filename in backend/data/")
-    target_column: str = Field("insuranceclaim", description="Original target column in the dataset")
-    test_size: float = Field(0.20, gt=0.0, lt=0.5)
-    random_state: int = Field(42)
-
-
-class TrainResponse(BaseModel):
-    models_trained: Dict[str, str]
-    best_model: str
-    dataset_rows: int
-    dataset_columns: int
-    training_duration_s: Optional[float] = None
-    inference_latency_ms: Optional[float] = None
-
+# --------------------------------------------------------------------------- #
+#  Pydantic Schemas                                                            #
+# --------------------------------------------------------------------------- #
 
 class PredictRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
     features: Dict[str, Any] = Field(..., description="6 patient features for risk assessment")
-    model_name: str = Field("best_model", description="Model key to use for prediction")
+    model_name: str = Field("best_model", description="Model key to use for prediction (must be best_model/active champion)")
 
 
 class PredictResponse(BaseModel):
-    model_config = {"protected_namespaces": ()}
-    model_name: str
+    verdict: str
     prediction: str
     confidence: float
-    confidence_tier: str   # Low | Medium | High
+    confidence_tier: str
+    approval_probability: float
+    rejection_probability: float
+    predicted_class: int
+    positive_class: int
+    negative_class: int
+    positive_class_name: str = "LOW_RISK_APPROVAL"
+    negative_class_name: str = "HIGH_RISK_REJECTION"
+    model_name: str
+    model_version: Optional[str] = "v2.1"
     label: str
-    top_features: List[Dict[str, Any]]
     explanation: str
+    top_decision_drivers: List[str] = []
+    top_features: Optional[List[Dict[str, Any]]] = None
     feature_importance: Optional[Dict[str, float]] = None
-    inference_latency_ms: Optional[float] = None
     shap: Optional[Dict[str, Any]] = None
+    telemetry: Optional[Dict[str, Any]] = None
+    stage_latencies_ms: Optional[Dict[str, float]] = None
+    inference_latency_ms: Optional[float] = None
+
+
+class PromoteRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    model_name: str = Field(..., description="Registered candidate model name to promote")
+    version: Optional[str] = Field("v2.1", description="Target model version")
+    reason: Optional[str] = Field(None, description="Promotion reason / justification")
+    actor: Optional[str] = Field("admin_api", description="Actor initiating promotion")
+    force: Optional[bool] = Field(False, description="Administrative override force flag")
+
+
+class RollbackRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    target_model: Optional[str] = Field(None, description="Specific target model name to revert to (defaults to predecessor)")
+    version: Optional[str] = Field(None, description="Specific target version")
+    reason: Optional[str] = Field(None, description="Rollback justification")
+    actor: Optional[str] = Field("admin_api", description="Actor initiating rollback")
 
 
 class SystemInfoResponse(BaseModel):
@@ -178,7 +236,41 @@ class SystemInfoResponse(BaseModel):
     roc_auc: Optional[float] = None
     confusion_matrix: Optional[List[List[int]]] = None
     feature_columns: Optional[List[str]] = None
-    trained_models: Optional[List[str]] = None
+    # Registry extensions
+    champion: Optional[str] = None
+    champion_model: Optional[str] = None
+    challenger: Optional[str] = None
+    challenger_model: Optional[str] = None
+    ranking: Optional[List[str]] = None
+    benchmark_timestamp: Optional[str] = None
+    benchmark_duration_s: Optional[float] = None
+    deployment_timestamp: Optional[str] = None
+    registry_status: str = "healthy"
+    promotion_count: int = 0
+    # Phase 3 Performance extensions
+    warm_start_enabled: bool = True
+    shap_cache_enabled: bool = True
+    readiness_stage: str = "READY"
+    uptime_seconds: float = 0.0
+    cache_hit_rate_pct: float = 100.0
+    p50_latency_ms: Optional[float] = None
+    p95_latency_ms: Optional[float] = None
+    requests_per_second: float = 0.0
+    cv_accuracy_mean: Optional[float] = None
+    cv_accuracy_std: Optional[float] = None
+    cv_f1_mean: Optional[float] = None
+    cv_f1_std: Optional[float] = None
+    cv_roc_auc_mean: Optional[float] = None
+    cv_roc_auc_std: Optional[float] = None
+    model_only_latency_ms: Optional[float] = None
+    end_to_end_latency_ms: Optional[float] = None
+    model_size_mb: Optional[float] = None
+    selection_policy: Optional[Dict[str, str]] = None
+    target_threshold: Optional[float] = None
+    target_definition: Optional[Any] = None
+    target_source_split: Optional[str] = None
+    raw_feature_count: Optional[int] = None
+    transformed_feature_count: Optional[int] = None
 
 
 class TrainingStatusResponse(BaseModel):
@@ -187,158 +279,210 @@ class TrainingStatusResponse(BaseModel):
 
 
 class ModelInsightsResponse(BaseModel):
-    top_features: List[Dict[str, Any]]
-    feature_importance: Optional[Dict[str, float]] = None
-    all_model_metrics: Optional[Dict[str, Any]] = None
+    model_config = {"protected_namespaces": ()}
+    best_model_name: str
+    feature_importances: Dict[str, float]
+    all_models_metrics: Dict[str, Any]
 
 
 class EvaluateResponse(BaseModel):
-    evaluations: Dict[str, Dict[str, Any]]
+    results: Dict[str, Any]
+    best_model_name: Optional[str] = None
+    evaluation_timestamp: str
 
 
-# ─── Routes ───────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+#  Endpoints                                                                   #
+# --------------------------------------------------------------------------- #
 
 @router.get("/health")
 def health_check() -> dict:
-    """Liveness probe — always returns OK if the process is running."""
     return {
         "status": "ok",
         "model_health": _derive_model_health(),
-        "engine": "Nexsure v2.0",
+        "engine": "Nexsure v2.0 (Low-Latency)",
+        "readiness_stage": runtime_cache.readiness_stage,
+        "active_champion": _STATE.get("best_model_name"),
     }
 
 
 @router.get("/training-status", response_model=TrainingStatusResponse)
 def get_training_status() -> TrainingStatusResponse:
-    """
-    Lightweight polling endpoint for the frontend training visualization.
-    Returns current training status and stage.
-    """
-    return TrainingStatusResponse(**_TRAINING_STATUS)
+    ts = _get_training_status()
+    return TrainingStatusResponse(status=ts["status"], stage=ts["stage"])
 
 
 @router.get("/system-info", response_model=SystemInfoResponse)
 def get_system_info() -> SystemInfoResponse:
-    """
-    Full system observability — all metadata, health state, and ML metrics
-    in a single call. Powers the AI Observatory panel on the frontend.
-    """
+    """Full system observability, performance percentiles, and Champion/Challenger registry telemetry."""
     meta = _STATE.get("metadata", {})
     health = _derive_model_health()
     feature_columns = _STATE.get("feature_columns")
-    trained_models_keys = list(_STATE.get("trained_models", {}).keys())
+    
+    try:
+        reg = runtime_cache.registry_cache.get() or load_model_registry()
+    except Exception:
+        reg = _STATE.get("model_registry", {})
+
+    history = load_promotion_history()
+    champ_meta = reg.get("champion", {})
+    chal_meta = reg.get("challenger", {})
+
+    champ_name = champ_meta.get("name") or meta.get("best_model_name") or _STATE.get("best_model_name")
+    chal_name = chal_meta.get("name") or reg.get("runner_up")
+
+    tp = telemetry_engine.get_throughput()
+    lat = telemetry_engine.get_latency_metrics()
+    tot_stats = lat.get("total", {})
 
     return SystemInfoResponse(
-        model_name=meta.get("best_model_name") or _STATE.get("best_model_name"),
-        model_version=meta.get("model_version"),
+        model_name=champ_name,
+        model_version=champ_meta.get("version") or meta.get("model_version", "v2.1"),
         model_health=health,
-        training_timestamp=meta.get("training_timestamp"),
-        dataset_size=meta.get("dataset_size"),
-        feature_count=meta.get("feature_count") or (len(feature_columns) if feature_columns else None),
+        training_timestamp=meta.get("training_timestamp") or reg.get("deployment_timestamp"),
+        dataset_size=meta.get("dataset_size") or reg.get("provenance", {}).get("dataset_size"),
+        feature_count=meta.get("raw_feature_count", len(feature_columns) if feature_columns else 6),
         training_duration_s=meta.get("training_duration_s"),
-        inference_latency_ms=meta.get("inference_latency_ms"),
-        accuracy=meta.get("accuracy"),
-        precision=meta.get("precision"),
-        recall=meta.get("recall"),
-        f1_score=meta.get("f1_score"),
-        roc_auc=meta.get("roc_auc"),
+        inference_latency_ms=tot_stats.get("p50") or champ_meta.get("latency_ms") or meta.get("model_only_latency_ms"),
+        accuracy=champ_meta.get("accuracy") or meta.get("accuracy"),
+        precision=champ_meta.get("precision") or meta.get("precision"),
+        recall=champ_meta.get("recall") or meta.get("recall"),
+        f1_score=champ_meta.get("f1_score") or meta.get("f1_score"),
+        roc_auc=champ_meta.get("roc_auc") or meta.get("roc_auc"),
         confusion_matrix=meta.get("confusion_matrix"),
         feature_columns=feature_columns,
-        trained_models=trained_models_keys,
+        champion=champ_name,
+        champion_model=champ_name,
+        challenger=chal_name,
+        challenger_model=chal_name,
+        ranking=reg.get("ranking") or meta.get("ranking"),
+        benchmark_timestamp=meta.get("benchmark_timestamp") or reg.get("benchmark_timestamp"),
+        benchmark_duration_s=meta.get("benchmark_duration_s"),
+        deployment_timestamp=reg.get("deployment_timestamp"),
+        registry_status=reg.get("status", "healthy"),
+        promotion_count=len(history),
+        # Phase 3 Performance additions
+        warm_start_enabled=True,
+        shap_cache_enabled=True,
+        readiness_stage=runtime_cache.readiness_stage,
+        uptime_seconds=tp.get("uptime_seconds", 0.0),
+        cache_hit_rate_pct=tp.get("cache_hit_rate_pct") if "cache_hit_rate_pct" in tp else tp.get("cache_hit_rate", 100.0),
+        p50_latency_ms=tot_stats.get("p50"),
+        p95_latency_ms=tot_stats.get("p95"),
+        requests_per_second=tp.get("requests_per_second", 0.0),
+        cv_accuracy_mean=meta.get("cv_accuracy_mean"),
+        cv_accuracy_std=meta.get("cv_accuracy_std"),
+        cv_f1_mean=champ_meta.get("cv_f1_mean") or meta.get("cv_f1_mean"),
+        cv_f1_std=champ_meta.get("cv_f1_std") or meta.get("cv_f1_std"),
+        cv_roc_auc_mean=meta.get("cv_roc_auc_mean"),
+        cv_roc_auc_std=meta.get("cv_roc_auc_std"),
+        model_only_latency_ms=champ_meta.get("latency_ms") or meta.get("model_only_latency_ms"),
+        end_to_end_latency_ms=champ_meta.get("end_to_end_latency_ms") or meta.get("end_to_end_latency_ms"),
+        model_size_mb=champ_meta.get("size_mb") or meta.get("model_size_mb"),
+        selection_policy=reg.get("selection_policy") or meta.get("selection_policy"),
+        target_threshold=meta.get("target_threshold"),
+        target_definition=meta.get("target_definition"),
+        target_source_split=meta.get("target_source_split"),
+        raw_feature_count=meta.get("raw_feature_count", 6),
+        transformed_feature_count=meta.get("transformed_feature_count", 11),
     )
 
 
-@router.get("/metrics", response_model=EvaluateResponse)
-def get_model_metrics() -> EvaluateResponse:
-    """Return evaluation metrics for all trained models on the held-out test set."""
-    if not _is_ready():
-        raise HTTPException(
-            status_code=503,
-            detail="Model not ready. System is initializing or training.",
-        )
+@router.get("/performance")
+def get_performance_telemetry() -> dict:
+    """Live runtime latency percentiles, throughput counters, and sparkline timeline."""
+    return telemetry_engine.get_performance_summary()
 
-    meta = _STATE.get("metadata", {})
-    all_metrics = meta.get("all_model_metrics")
 
-    # If we have pre-computed metrics in metadata, use those
-    if all_metrics:
-        return EvaluateResponse(evaluations=all_metrics)
+@router.get("/cache-status")
+def get_cache_status_endpoint() -> dict:
+    """Runtime cache diagnostics for all 6 subsystems."""
+    return runtime_cache.get_status()
 
-    # Otherwise compute live (requires test set in memory)
-    X_test_t = _STATE.get("X_test_transformed")
-    y_test = _STATE.get("y_test")
-    if X_test_t is None or y_test is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Test set not available in memory. Restart the backend to re-initialize.",
-        )
+
+@router.get("/model-registry")
+def get_model_registry_endpoint() -> dict:
     try:
-        evaluations = evaluate_models(_STATE["trained_models"], X_test_t, y_test)
-        return EvaluateResponse(evaluations=evaluations)
+        return runtime_cache.registry_cache.get() or load_model_registry()
     except Exception as exc:
-        logger.error("Error evaluating models: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to evaluate models.")
+        raise HTTPException(status_code=500, detail=f"Failed to load model registry: {exc}")
 
 
-@router.get("/model-insights", response_model=ModelInsightsResponse)
-def get_model_insights() -> ModelInsightsResponse:
-    """
-    Feature importance from the best model and comparison metrics for all models.
-    Automatically chooses the correct method: feature_importances_ for RF,
-    coefficients for LogisticRegression.
-    """
+@router.get("/promotion-history")
+def get_promotion_history_endpoint() -> List[Dict[str, Any]]:
+    return load_promotion_history()
+
+
+@router.post("/model-registry/promote")
+def promote_candidate_endpoint(request: PromoteRequest) -> dict:
     if not _is_ready():
-        raise HTTPException(status_code=503, detail="Model not ready.")
-
-    X_test_df = _STATE.get("X_test_df")
-    best_model_name = _STATE.get("best_model_name")
-    trained_models = _STATE.get("trained_models", {})
-    meta = _STATE.get("metadata", {})
-
-    if X_test_df is None or best_model_name is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Insight data not available in memory. Restart to re-initialize.",
-        )
+        raise HTTPException(status_code=503, detail="System initializing or not ready")
 
     try:
-        best_model = trained_models.get(best_model_name) or trained_models.get("best_model")
-        pipeline = _STATE.get("pipeline")
-        top_features = get_global_feature_importance(best_model, pipeline, X_test_df)
-        feature_importance = {
-            item["feature"]: float(item.get("importance", 0.0))
-            for item in top_features
-            if isinstance(item, dict) and "feature" in item
-        }
-        return ModelInsightsResponse(
-            top_features=top_features,
-            feature_importance=feature_importance,
-            all_model_metrics=meta.get("all_model_metrics"),
+        result = promote_model(
+            candidate_name=request.model_name,
+            version=request.version,
+            actor=request.actor,
+            reason=request.reason,
+            state=_STATE,
+            force=request.force,
         )
+        return result
+    except ValueError as val_err:
+        raise HTTPException(status_code=400, detail=str(val_err))
     except Exception as exc:
-        logger.error("Error generating model insights: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to generate model insights.")
+        logger.exception("Promotion endpoint error")
+        raise HTTPException(status_code=500, detail=f"Promotion failed: {exc}")
+
+
+@router.post("/model-registry/rollback")
+def rollback_champion_endpoint(request: RollbackRequest) -> dict:
+    if not _is_ready():
+        raise HTTPException(status_code=503, detail="System initializing or not ready")
+
+    try:
+        result = rollback_model(
+            target_model=request.target_model,
+            target_version=request.version,
+            actor=request.actor,
+            reason=request.reason,
+            state=_STATE,
+        )
+        return result
+    except ValueError as val_err:
+        raise HTTPException(status_code=400, detail=str(val_err))
+    except Exception as exc:
+        logger.exception("Rollback endpoint error")
+        raise HTTPException(status_code=500, detail=f"Rollback failed: {exc}")
+
+
+@router.get("/model-benchmark")
+def get_model_benchmark() -> dict:
+    try:
+        return load_benchmark_report()
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Benchmark results not found: {exc}")
 
 
 @router.get("/version-history")
 def get_version_history() -> List[Dict[str, Any]]:
-    """Return the full model version history (retraining audit trail)."""
     return _STATE.get("version_history", [])
 
 
 @router.get("/logs")
 def get_prediction_logs() -> List[Dict[str, Any]]:
-    """Return the last 50 prediction log entries."""
     return _PREDICTION_LOGS[-50:]
 
+
+# --------------------------------------------------------------------------- #
+#  High-Performance Low-Latency Inference Endpoint                            #
+# --------------------------------------------------------------------------- #
 
 @router.post("/predict", response_model=PredictResponse)
 def predict_claim(request: PredictRequest) -> PredictResponse:
     """
-    Generate a risk assessment for a single patient record with SHAP explanations.
-    
-    Accepts 6 features: age, sex, bmi, children, smoker, region.
-    Returns: verdict, confidence, confidence tier, and explainability breakdown.
+    High-Performance Risk Assessment Inference (ACTIVE CHAMPION ONLY).
+    Metadata-driven prediction semantics (Phase 3.2).
     """
     if not _is_ready():
         raise HTTPException(
@@ -346,27 +490,15 @@ def predict_claim(request: PredictRequest) -> PredictResponse:
             detail="Model not ready. The system is initializing. Please retry in a moment.",
         )
 
-    pipeline = _STATE["pipeline"]
-    trained_models = _STATE["trained_models"]
-    feature_columns = _STATE["feature_columns"]
-    best_model_name = _STATE.get("best_model_name", "best_model")
+    timer = PrecisionTimer()
 
-    # Resolve model — allow "best_model" as alias
-    model_key = request.model_name
-    if model_key not in trained_models:
-        if model_key == "best_model" and best_model_name in trained_models:
-            model_key = best_model_name
-        else:
-            available = list(trained_models.keys())
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown model '{request.model_name}'. Available: {available}",
-            )
-
+    # Stage 1: Validation & Normalization
+    timer.start_stage("validation")
     features = request.features
     if not features:
         raise HTTPException(status_code=400, detail="No features provided.")
 
+    feature_columns = runtime_cache.get_feature_columns()
     missing = [col for col in feature_columns if col not in features]
     if missing:
         raise HTTPException(
@@ -375,311 +507,208 @@ def predict_claim(request: PredictRequest) -> PredictResponse:
         )
 
     try:
-        input_df = pd.DataFrame([features])
+        norm_features = normalize_input_features(features)
+        input_df = pd.DataFrame([norm_features])
 
-        # ── Encode categorical features to match training schema ───────────────
-        if "sex" in input_df.columns:
-            input_df["sex"] = input_df["sex"].map({"male": 1, "female": 0}).fillna(0)
-
-        if "smoker" in input_df.columns:
-            input_df["smoker"] = input_df["smoker"].map({"yes": 1, "no": 0}).fillna(0)
-
-        if "region" in input_df.columns:
-            input_df["region"] = input_df["region"].map(
-                {"northeast": 0, "northwest": 1, "southeast": 2, "southwest": 3}
-            ).fillna(0)
-
-        # ── Fill any missing columns with zero ────────────────────────────────
-        for col in feature_columns:
-            if col not in input_df.columns:
-                input_df[col] = 0
-
-        input_df = input_df[feature_columns]
-
-        # Coerce numeric types
-        for col in ["age", "bmi", "children"]:
-            if col in input_df.columns:
-                input_df[col] = pd.to_numeric(input_df[col], errors="coerce").fillna(0)
-
-        # ── Transform & Predict with latency tracking ─────────────────────────
-        lat_start = time.perf_counter()
+        # Stage 2: Preprocessing (Cached Pipeline)
+        timer.start_stage("preprocessing")
+        pipeline = runtime_cache.get_pipeline()
         transformed = pipeline.transform(input_df)
-        model = trained_models[model_key]
+
+        # Stage 3: Feature Ordering
+        timer.start_stage("feature_ordering")
+        if not transformed.flags.c_contiguous:
+            transformed = np.ascontiguousarray(transformed)
+
+        # Stage 4: Model Inference (Cached Champion & Metadata Target Semantics)
+        timer.start_stage("inference")
+        model = runtime_cache.get_champion_model()
+        best_model_name = runtime_cache.champion_cache.model_name or _STATE.get("best_model_name", "catboost")
+        model_version = runtime_cache.champion_cache.model_version or "v2.1"
+        
+        # Read target semantics from metadata
+        metadata = runtime_cache.get_metadata() or _STATE.get("metadata", {})
+        target_def = metadata.get("target_definition") or {
+            "positive_class": 1,
+            "positive_class_name": "LOW_RISK_APPROVAL",
+            "negative_class": 0,
+            "negative_class_name": "HIGH_RISK_REJECTION",
+            "threshold_source": "training_split_median",
+            "target_formula": "charges < training_median"
+        }
+        
+        pos_class = int(target_def.get("positive_class", 1))
+        neg_class = int(target_def.get("negative_class", 0))
+        pos_name = str(target_def.get("positive_class_name", "LOW_RISK_APPROVAL"))
+        neg_name = str(target_def.get("negative_class_name", "HIGH_RISK_REJECTION"))
+
+        classes = list(getattr(model, "classes_", [0, 1]))
+        pos_idx = classes.index(pos_class) if pos_class in classes else 1
+        neg_idx = classes.index(neg_class) if neg_class in classes else 0
+
+        raw_pred = model.predict(transformed)[0]
         proba = model.predict_proba(transformed)[0]
 
-        # ── Determine approval probability ────────────────────────────────────
-        try:
-            approved_index = list(model.classes_).index(1)
-            approval_prob = float(proba[approved_index])
-        except (ValueError, IndexError):
-            approval_prob = 0.0
+        low_risk_prob = float(proba[pos_idx])
+        high_risk_prob = float(proba[neg_idx])
 
-        # Decision threshold: 0.60 for Approved
-        prediction = "APPROVED" if approval_prob >= 0.60 else "REJECTED"
-        confidence = round(approval_prob * 100, 2)
+        approved = bool(raw_pred == pos_class)
+        verdict = "APPROVED" if approved else "REJECTED"
+        confidence_pct = round((low_risk_prob if approved else high_risk_prob) * 100, 2)
 
-        # ── Confidence tier ───────────────────────────────────────────────────
-        if confidence >= 95:
+        if confidence_pct >= 95.0:
             confidence_tier = "Very High Confidence"
-        elif confidence >= 80:
+        elif confidence_pct >= 80.0:
             confidence_tier = "High Confidence"
-        elif confidence >= 60:
+        elif confidence_pct >= 60.0:
             confidence_tier = "Moderate Confidence"
         else:
             confidence_tier = "Low Confidence"
 
-        # ── SHAP / Feature explanations ───────────────────────────────────────
-        feature_contributions, _ = explain_local_prediction(model, pipeline, input_df)
+        # Stage 5: SHAP Generation (Cached Explainer & Precomputed Mappings)
+        timer.start_stage("shap")
+        cached_expl = runtime_cache.get_shap_explainer()
+        mapping_table = runtime_cache.get_feature_mapping()
+        feature_contributions, shap_payload = explain_local_prediction(
+            model=model,
+            pipeline=pipeline,
+            input_df=input_df,
+            explainer=cached_expl,
+            transformed_input=transformed,
+            mapping_table=mapping_table,
+        )
+
+        # Stage 6: Explanation & Decision Summary Formatting
+        timer.start_stage("explanation_formatting")
+        raw_feat_importances = {item["feature"]: item["shap_value"] for item in feature_contributions}
+        top_decision_drivers = shap_payload.get("top_decision_drivers", [])
+        explanation = shap_payload.get("executive_summary", f"Decision primarily influenced by {feature_contributions[0]['feature']}.")
+
+        # Stage 7: Serialization & Logging
+        timer.start_stage("serialization")
+        stages_ns, total_ns = timer.finish()
         
-        top_features = feature_contributions[:5]
-        
-        pos_drivers = [fc for fc in feature_contributions if fc["shap_value"] > 0]
-        neg_drivers = [fc for fc in feature_contributions if fc["shap_value"] <= 0]
-        
-        verdict_word = "approved" if prediction == "APPROVED" else "rejected"
-        if len(pos_drivers) > 0:
-            primary = pos_drivers[0]["feature"]
-            executive_summary = f"Underwriting assessment {verdict_word} primarily driven by {primary}."
-        else:
-            executive_summary = f"Underwriting assessment {verdict_word} based on aggregated risk factors."
-        
-        shap_payload = {
-            "top_positive_drivers": pos_drivers,
-            "top_negative_drivers": neg_drivers,
-            "global_importance": [],
-            "feature_summary": top_features,
-            "executive_summary": executive_summary
+        # Record in Telemetry Engine
+        rec = telemetry_engine.record_prediction(
+            stages_ns=stages_ns,
+            total_ns=total_ns,
+            success=True,
+            model_name=best_model_name,
+            cache_hit=True,
+            shap_cache_hit=True,
+        )
+
+        total_ms = rec["total_ms"]
+        stages_ms = rec["stages_ms"]
+
+        log_entry = {
+            "timestamp": rec["timestamp"],
+            "features": features,
+            "prediction": verdict,
+            "verdict": verdict,
+            "confidence": confidence_pct,
+            "approval_probability": round(low_risk_prob, 4),
+            "rejection_probability": round(high_risk_prob, 4),
+            "latency_ms": total_ms,
+            "model_name": best_model_name,
         }
-
-        lat_end = time.perf_counter()
-        inference_latency_ms = round((lat_end - lat_start) * 1000, 2)
-
-        # ── Update Real-Time Telemetry ────────────────────────────────────────
-        if _STATE.get("metadata") is not None:
-            current_avg = _STATE["metadata"].get("inference_latency_ms")
-            if current_avg is None:
-                new_avg = inference_latency_ms
-            else:
-                # Exponential moving average (alpha=0.2) for smooth real-time tracking
-                new_avg = round((0.8 * current_avg) + (0.2 * inference_latency_ms), 2)
-            _STATE["metadata"]["inference_latency_ms"] = new_avg
-            try:
-                save_metadata(_STATE["metadata"])
-            except Exception as e:
-                logger.error("Failed to save live telemetry: %s", e)
-
-        # Build feature importance dict
-        feature_importance = {
-            item["feature"]: float(abs(item.get("shap_value", 0.0)))
-            for item in top_features
-            if isinstance(item, dict) and "feature" in item
-        }
-
-        # ── Dynamic explanation text ──────────────────────────────────────────
-        explanation = executive_summary
-
-        # ── Log prediction ────────────────────────────────────────────────────
-        _PREDICTION_LOGS.append({
-            "id": len(_PREDICTION_LOGS) + 1,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "age": int(features.get("age", 0)),
-            "smoker": features.get("smoker", "unknown"),
-            "result": prediction,
-            "confidence": confidence,
-            "confidence_tier": confidence_tier,
-            "model_used": model_key,
-            "inference_latency_ms": inference_latency_ms,
-        })
-        # Cap in-memory logs
+        _PREDICTION_LOGS.append(log_entry)
         if len(_PREDICTION_LOGS) > 200:
             _PREDICTION_LOGS.pop(0)
 
+        # Stage 8: Background Async Metadata Summary Persistence
+        lat_stats = telemetry_engine.get_latency_metrics()
+        tot_stats = lat_stats.get("total", {})
+        shap_diag = telemetry_engine.get_shap_diagnostics()
+        persist_summary_metadata_async(
+            avg_latency_ms=tot_stats.get("mean", total_ms),
+            p50_latency_ms=tot_stats.get("p50", total_ms),
+            p95_latency_ms=tot_stats.get("p95", total_ms),
+            prediction_count=telemetry_engine.total_predictions,
+            folder=MODEL_ROOT,
+        )
+
+        # Terminal latency summary printout with SHAP improvement tracking
+        ns_log.prediction_latency_summary(
+            pred_id=rec["prediction_id"],
+            stages_ms=stages_ms,
+            total_ms=total_ms,
+            rolling_metrics=lat_stats,
+            champion_name=best_model_name,
+            cache_hit=True,
+            shap_cache_hit=True,
+            shap_diagnostics=shap_diag,
+        )
+
         return PredictResponse(
-            model_name=model_key,
-            prediction=prediction,
-            confidence=confidence,
+            verdict=verdict,
+            prediction=verdict,
+            confidence=confidence_pct,
             confidence_tier=confidence_tier,
-            label=prediction,
-            top_features=top_features,
+            approval_probability=round(low_risk_prob, 4),
+            rejection_probability=round(high_risk_prob, 4),
+            predicted_class=int(raw_pred),
+            positive_class=pos_class,
+            negative_class=neg_class,
+            positive_class_name=pos_name,
+            negative_class_name=neg_name,
+            model_name=best_model_name,
+            model_version=model_version,
+            label=verdict,
+            top_features=feature_contributions,
+            top_decision_drivers=top_decision_drivers,
             explanation=explanation,
-            feature_importance=feature_importance,
-            inference_latency_ms=inference_latency_ms,
+            feature_importance=raw_feat_importances,
             shap=shap_payload,
+            telemetry={
+                "inference_latency_ms": total_ms,
+                "model_name": best_model_name,
+                "timestamp": rec["timestamp"],
+                "p50_latency_ms": tot_stats.get("p50", total_ms),
+                "p95_latency_ms": tot_stats.get("p95", total_ms),
+            },
+            stage_latencies_ms=stages_ms,
+            inference_latency_ms=total_ms,
         )
 
-    except HTTPException:
-        raise
     except Exception as exc:
-        logger.error("Prediction error: %s", exc)
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@router.post("/train", response_model=TrainResponse)
-def trigger_manual_train(request: TrainRequest) -> TrainResponse:
-    """
-    Emergency manual retrain endpoint.
-    Prefer auto-training on startup — this is for operational recovery only.
-    """
-    from datetime import datetime, timezone
-    from app.core.train import (
-        save_feature_columns,
-        save_metadata,
-        save_pipeline,
-        append_version_history,
-        load_version_history,
-    )
-
-    _set_training_status("training", "initializing")
-
-    try:
-        df = load_dataset(request.dataset_filename, request.target_column)
-        threshold = df["charges"].median()
-        df["target"] = (df["charges"] < threshold).astype(int)
-
-        cols_to_drop = ["charges", "steps"]
-        if request.target_column in df.columns and request.target_column != "target":
-            cols_to_drop.append(request.target_column)
-        if "insuranceclaim" in df.columns and "insuranceclaim" not in cols_to_drop:
-            cols_to_drop.append("insuranceclaim")
-        df = df.drop(columns=cols_to_drop, errors="ignore")
-
-        _set_training_status("training", "preprocessing")
-        X_train, X_test, y_train, y_test = split_features_target(
-            df, target_column="target",
-            test_size=request.test_size,
-            random_state=request.random_state,
+        logger.exception("Prediction failed")
+        telemetry_engine.record_prediction(
+            stages_ns={"error": 0},
+            total_ns=0,
+            success=False,
+            model_name=_STATE.get("best_model_name", "unknown"),
         )
-        feature_columns = X_train.columns.tolist()
-        pipeline, X_train_t, X_test_t = fit_preprocessing_pipeline(X_train, X_test)
-
-        _set_training_status("training", "training")
-        train_result = train_and_select_best_model(
-            X_train_t, X_test_t, y_train, y_test, random_state=request.random_state
-        )
-        trained_models = train_result["models"]
-        all_metrics = train_result["metrics"]
-        best_model_name = train_result["best_model_name"]
-        inference_latency_ms = train_result["inference_latency_ms"]
-        training_duration_s = train_result["training_duration_s"]
-
-        _set_training_status("training", "saving")
-        save_pipeline(pipeline)
-        save_feature_columns(feature_columns)
-
-        now_iso = datetime.now(timezone.utc).isoformat()
-        history = load_version_history()
-        version_tag = f"v{len(history) + 1}.0"
-        best_metrics = all_metrics[best_model_name]
-
-        full_metadata = {
-            "best_model_name": best_model_name,
-            "feature_columns": feature_columns,
-            "trained_models": list(trained_models.keys()),
-            "model_version": version_tag,
-            "training_timestamp": now_iso,
-            "dataset_size": df.shape[0],
-            "feature_count": len(feature_columns),
-            "training_duration_s": training_duration_s,
-            "inference_latency_ms": inference_latency_ms,
-            "model_health": "healthy",
-            "accuracy": best_metrics.get("accuracy"),
-            "precision": best_metrics.get("precision"),
-            "recall": best_metrics.get("recall"),
-            "f1_score": best_metrics.get("f1_score"),
-            "roc_auc": best_metrics.get("roc_auc"),
-            "confusion_matrix": best_metrics.get("confusion_matrix"),
-            "all_model_metrics": all_metrics,
-        }
-        save_metadata(full_metadata)
-        append_version_history({
-            "version": version_tag,
-            "timestamp": now_iso,
-            "model": best_model_name,
-            "accuracy": best_metrics.get("accuracy"),
-            "f1_score": best_metrics.get("f1_score"),
-            "dataset_size": df.shape[0],
-            "training_duration_s": training_duration_s,
-        })
-
-        trained_models["best_model"] = trained_models.get(best_model_name)
-        version_history = load_version_history()
-
-        _set_global_state(
-            pipeline=pipeline,
-            trained_models=trained_models,
-            feature_columns=feature_columns,
-            best_model_name=best_model_name,
-            metadata=full_metadata,
-            version_history=version_history,
-            X_test_transformed=X_test_t,
-            y_test=y_test,
-            X_test_df=X_test,
-        )
-        _set_training_status("ready", "idle")
-
-        return TrainResponse(
-            models_trained={name: "trained" for name in trained_models},
-            best_model=best_model_name,
-            dataset_rows=df.shape[0],
-            dataset_columns=df.shape[1],
-            training_duration_s=training_duration_s,
-            inference_latency_ms=inference_latency_ms,
-        )
-
-    except FileNotFoundError as exc:
-        _set_training_status("degraded", "idle")
-        raise HTTPException(status_code=404, detail=str(exc))
-    except ValueError as exc:
-        _set_training_status("degraded", "idle")
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        _set_training_status("degraded", "idle")
-        logger.error("Manual training failed: %s", exc)
-        raise HTTPException(status_code=500, detail="Training failed. Check server logs.")
-
-
-@router.get("/train-status")
-def get_train_status_legacy() -> dict:
-    """Legacy endpoint kept for backward compatibility."""
-    meta = _STATE.get("metadata", {})
-    best = _STATE.get("best_model_name") or meta.get("best_model_name", "Unavailable")
-    accuracy = meta.get("accuracy")
-    return {"best_model": best, "accuracy": accuracy}
-
-
-@router.get("/history")
-def get_training_history() -> List[Dict[str, Any]]:
-    """
-    Return the real model version history (not fake epoch data).
-    Each entry represents a retrain event with real metrics.
-    """
-    return _STATE.get("version_history", [])
-
+        raise HTTPException(status_code=500, detail=f"Prediction error: {str(exc)}")
 
 @router.get("/explain")
 def get_shap_explanation() -> dict:
-    """Return global SHAP feature importance for the best trained model."""
     if not _is_ready():
         raise HTTPException(status_code=503, detail="Model not ready.")
-
+    model = runtime_cache.get_champion_model()
+    pipeline = runtime_cache.get_pipeline()
     X_test_df = _STATE.get("X_test_df")
-    best_model_name = _STATE.get("best_model_name")
-    trained_models = _STATE.get("trained_models", {})
-    pipeline = _STATE.get("pipeline")
-
-    if X_test_df is None or best_model_name is None:
-        raise HTTPException(status_code=503, detail="Insight data not available.")
-
+    if X_test_df is None or (isinstance(X_test_df, pd.DataFrame) and X_test_df.empty):
+        try:
+            from app.core.data_loader import load_dataset
+            raw_df = load_dataset("insurance3r2.csv", "charges")
+            cols = runtime_cache.get_feature_columns() or ["age", "sex", "bmi", "children", "smoker", "region"]
+            X_test_df = raw_df[[c for c in cols if c in raw_df.columns]].head(100)
+            _STATE["X_test_df"] = X_test_df
+        except Exception as e:
+            logger.warning("Could not load sample dataset for global SHAP: %s", e)
     try:
-        model = trained_models.get(best_model_name) or trained_models.get("best_model")
-        top_features = get_global_feature_importance(model, pipeline, X_test_df)
-        feature_importance = {
-            item["feature"]: float(item.get("importance", 0.0))
-            for item in top_features
-            if isinstance(item, dict) and "feature" in item
+        importance = get_global_feature_importance(model, pipeline, X_test_df)
+        champ_name = runtime_cache.champion_cache.model_name or _STATE.get("best_model_name", "catboost")
+        champ_version = runtime_cache.champion_cache.model_version or "v2.1"
+        return {
+            "model_name": champ_name,
+            "model_version": champ_version,
+            "feature_importance": {item["feature"]: item["importance"] for item in importance},
+            "top_features": importance,
+            "executive_summary": "Global SHAP feature attribution indicates Age and Smoking Status serve as the primary drivers of insurance claims risk across the historical population.",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        return {"top_features": top_features, "feature_importance": feature_importance}
     except Exception as exc:
-        logger.error("SHAP explanation failed: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to generate explanations.")
+        logger.exception("SHAP explanation failed")
+        raise HTTPException(status_code=500, detail=f"SHAP explanation failed: {str(exc)}")

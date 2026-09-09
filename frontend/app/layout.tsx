@@ -1,5 +1,5 @@
 import type { Metadata } from 'next'
-import { Inter } from 'next/font/google'
+import { Inter, JetBrains_Mono } from 'next/font/google'
 import './globals.css'
 
 const inter = Inter({
@@ -8,10 +8,16 @@ const inter = Inter({
   display: 'swap',
 })
 
+const jetbrainsMono = JetBrains_Mono({
+  subsets: ['latin'],
+  variable: '--font-mono',
+  display: 'swap',
+})
+
 export const metadata: Metadata = {
+  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'),
   title: 'Nexsure | AI Insurance Risk Intelligence',
-  description:
-    'Production-grade autonomous AI platform for insurance risk assessment, explainability, and observability.',
+  description: 'Production-grade AI underwriting intelligence platform.',
   keywords: [
     'AI insurance',
     'health insurance risk assessment',
@@ -23,7 +29,7 @@ export const metadata: Metadata = {
   robots: 'index, follow',
   openGraph: {
     title: 'Nexsure | AI Insurance Risk Intelligence',
-    description: 'Production-grade autonomous AI platform for insurance risk assessment, explainability, and observability.',
+    description: 'Production-grade AI underwriting intelligence platform.',
     type: 'website',
   },
 }
@@ -34,15 +40,7 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en" className={inter.variable}>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
-        <link
-          href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
-          rel="stylesheet"
-        />
-      </head>
+    <html lang="en" className={`${inter.variable} ${jetbrainsMono.variable}`}>
       <body className="antialiased grid-bg noise-overlay">
         {children}
       </body>
