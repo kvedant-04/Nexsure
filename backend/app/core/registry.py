@@ -21,69 +21,29 @@ import joblib
 logger = logging.getLogger(__name__)
 
 
+from app.core.paths import (
+    get_benchmark_results_path,
+    get_champion_path,
+    get_feature_columns_path,
+    get_immutable_artifact_path,
+    get_immutable_metadata_path,
+    get_metadata_path,
+    get_model_registry_backup_path,
+    get_model_registry_dir,
+    get_model_registry_path,
+    get_model_root_folder,
+    get_promotion_history_path,
+    get_version_history_path,
+)
+
 # --------------------------------------------------------------------------- #
-#  Path Helpers                                                                #
+#  Path Helpers (Backward Compatibility Aliases)                               #
 # --------------------------------------------------------------------------- #
 
 def _model_root() -> Path:
-    """Resolve the model/ directory relative to this file."""
-    return Path(__file__).resolve().parents[3] / "model"
+    """Resolve the model/ directory using centralized path management."""
+    return get_model_root_folder()
 
-
-def get_model_root_folder() -> Path:
-    """Public alias for model root."""
-    return _model_root()
-
-
-def get_model_registry_dir(folder: Optional[Path] = None) -> Path:
-    """Return the base registry directory for immutable versioned artifacts."""
-    return (folder or _model_root()) / "registry"
-
-
-def get_immutable_artifact_path(
-    model_name: str,
-    version: str,
-    folder: Optional[Path] = None,
-) -> Path:
-    """Path to an immutable, versioned model artifact: model/registry/<name>/<version>/model.joblib"""
-    return get_model_registry_dir(folder) / model_name / version / "model.joblib"
-
-
-def get_immutable_metadata_path(
-    model_name: str,
-    version: str,
-    folder: Optional[Path] = None,
-) -> Path:
-    """Path to metadata alongside the immutable artifact."""
-    return get_model_registry_dir(folder) / model_name / version / "metadata.json"
-
-
-def get_model_registry_path(folder: Optional[Path] = None) -> Path:
-    return (folder or _model_root()) / "model_registry.json"
-
-
-def get_model_registry_backup_path(folder: Optional[Path] = None) -> Path:
-    return (folder or _model_root()) / "model_registry.json.bak"
-
-
-def get_promotion_history_path(folder: Optional[Path] = None) -> Path:
-    return (folder or _model_root()) / "promotion_history.json"
-
-
-def get_benchmark_results_path(folder: Optional[Path] = None) -> Path:
-    return (folder or _model_root()) / "benchmark_results.json"
-
-
-def get_metadata_path(folder: Optional[Path] = None) -> Path:
-    return (folder or _model_root()) / "metadata.json"
-
-
-def get_version_history_path(folder: Optional[Path] = None) -> Path:
-    return (folder or _model_root()) / "version_history.json"
-
-
-def get_champion_path(folder: Optional[Path] = None) -> Path:
-    return (folder or _model_root()) / "best_model.pkl"
 
 
 # --------------------------------------------------------------------------- #

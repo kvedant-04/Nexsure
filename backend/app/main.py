@@ -41,15 +41,45 @@ app = FastAPI(
     description="Enterprise AI underwriting platform with Champion/Challenger Model Registry",
 )
 
+def _get_cors_origins() -> list[str]:
+    """Resolve allowed CORS origins from environment and local defaults."""
+    default_origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ]
+    resolved = list(default_origins)
+    
+    frontend_url = os.getenv("FRONTEND_URL")
+    if frontend_url:
+        for origin in frontend_url.split(","):
+            clean = origin.strip().rstrip("/")
+            if clean and clean not in resolved:
+                resolved.append(clean)
+                
+    cors_env = os.getenv("CORS_ORIGINS") or os.getenv("ALLOWED_ORIGINS")
+    if cors_env:
+        for origin in cors_env.split(","):
+            clean = origin.strip().rstrip("/")
+            if clean and clean not in resolved:
+                resolved.append(clean)
+                
+    return resolved
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_get_cors_origins(),
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 app.include_router(predict_router, prefix="/api")
+
 
 DATASET_FILENAME = "insurance3r2.csv"
 TARGET_COLUMN    = "charges"
@@ -101,6 +131,11 @@ async def startup_lifecycle():
     startup_start = time.perf_counter()
 
     from app.api.predict import _set_global_state, _set_training_status
+    from app.core.paths import (
+        get_model_root_folder,
+        validate_production_artifacts,
+        REQUIRED_PRODUCTION_ARTIFACTS,
+    )
     from app.core.registry import (
         all_artifacts_valid,
         load_champion_model,
@@ -113,7 +148,6 @@ async def startup_lifecycle():
         append_version_history_v2,
         load_benchmark_report,
         validate_registry_artifact,
-        get_model_root_folder,
     )
     from app.core.promotion import build_registry, validate_registry
     from app.core.cache_manager import runtime_cache
@@ -133,7 +167,9 @@ async def startup_lifecycle():
     ns_log.section("ARTIFACT & REGISTRY INTEGRITY CHECK")
     should_benchmark = False
 
-    if not all_artifacts_valid(MODEL_ROOT):
+    is_valid_production, missing_artifacts = validate_production_artifacts(MODEL_ROOT)
+    if not is_valid_production:
+        ns_log.warn(f"Missing production artifacts: {', '.join(missing_artifacts)}")
         if not validate_registry_artifact(MODEL_ROOT):
             try:
                 bench = load_benchmark_report(MODEL_ROOT)
@@ -148,11 +184,21 @@ async def startup_lifecycle():
             ns_log.warn("Core artifacts missing or invalid; full benchmark required")
             should_benchmark = True
     else:
-        ns_log.success("All artifacts and model registry verified")
+        ns_log.success(f"Verified all 7 required production artifacts: {', '.join(REQUIRED_PRODUCTION_ARTIFACTS)}")
+
+    # Final pre-startup validation check (ensure required files exist or benchmark triggers)
+    if not should_benchmark:
+        is_ready, missing = validate_production_artifacts(MODEL_ROOT)
+        if not is_ready:
+            raise RuntimeError(
+                f"[STARTUP FAILED] Missing required production artifact(s): {missing}. "
+                f"Expected directory: {MODEL_ROOT}"
+            )
 
     # -- Step 2a: FAST PATH -- Load Champion from Registry --------------------
     if not should_benchmark:
         ns_log.section("LOADING ACTIVE CHAMPION & REGISTRY")
+
         try:
             pipeline         = load_pipeline(MODEL_ROOT)
             feature_columns  = load_feature_columns(MODEL_ROOT)

@@ -178,6 +178,7 @@ class PredictRequest(BaseModel):
 
 
 class PredictResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
     verdict: str
     prediction: str
     confidence: float
@@ -274,6 +275,7 @@ class SystemInfoResponse(BaseModel):
 
 
 class TrainingStatusResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
     status: str
     stage: str
 
@@ -286,9 +288,11 @@ class ModelInsightsResponse(BaseModel):
 
 
 class EvaluateResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
     results: Dict[str, Any]
     best_model_name: Optional[str] = None
     evaluation_timestamp: str
+
 
 
 # --------------------------------------------------------------------------- #

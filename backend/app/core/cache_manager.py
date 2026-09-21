@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 import shap
 
+from app.core.paths import get_dataset_path
 from app.core.registry import (
     _model_root,
     get_champion_path,
@@ -446,19 +447,13 @@ class RuntimeCache:
 
             # 1. Load Background Sample from training dataset
             if sample_df is None:
-                data_candidates = [
-                    Path("backend/data/insurance3r2.csv"),
-                    Path("data/insurance3r2.csv"),
-                    Path("d:/Nexsure/backend/data/insurance3r2.csv"),
-                ]
                 raw_df = None
-                for p in data_candidates:
-                    if p.exists():
-                        try:
-                            raw_df = pd.read_csv(p)
-                            break
-                        except Exception:
-                            pass
+                try:
+                    dataset_file = get_dataset_path("insurance3r2.csv")
+                    if dataset_file.exists():
+                        raw_df = pd.read_csv(dataset_file)
+                except Exception as exc:
+                    logger.warning("Could not load background dataset from paths: %s", exc)
 
                 if raw_df is not None:
                     raw_cols = ["age", "sex", "bmi", "children", "smoker", "region"]

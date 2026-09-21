@@ -13,37 +13,15 @@ from app.core.evaluate import evaluate_model
 
 logger = logging.getLogger(__name__)
 
-# ─── Path Helpers ──────────────────────────────────────────────────────────────
+from app.core.paths import (
+    get_artifacts_folder,
+    get_feature_columns_path,
+    get_metadata_path,
+    get_model_file_path,
+    get_model_root_folder,
+    get_version_history_path,
+)
 
-def get_model_root_folder() -> Path:
-    """Return the root model folder under backend/model."""
-    current_file = Path(__file__).resolve()
-    return current_file.parents[3] / "model"
-
-
-def get_artifacts_folder() -> Path:
-    """Return the artifacts folder path for saving trained model variants."""
-    return get_model_root_folder() / "artifacts"
-
-
-def get_model_file_path(name: str = "best_model", folder: Path = None, extension: str = "pkl") -> Path:
-    folder = folder or get_model_root_folder()
-    return folder / f"{name}.{extension}"
-
-
-def get_metadata_path(folder: Path = None, filename: str = "metadata.json") -> Path:
-    folder = folder or get_model_root_folder()
-    return folder / filename
-
-
-def get_feature_columns_path(folder: Path = None, filename: str = "feature_columns.json") -> Path:
-    folder = folder or get_model_root_folder()
-    return folder / filename
-
-
-def get_version_history_path(folder: Path = None) -> Path:
-    folder = folder or get_model_root_folder()
-    return folder / "version_history.json"
 
 
 # ─── Artifact I/O ─────────────────────────────────────────────────────────────

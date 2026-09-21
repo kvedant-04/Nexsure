@@ -7,25 +7,8 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-def get_data_folder() -> Path:
-    """Return the absolute path to the backend data directory."""
-    current_file = Path(__file__).resolve()
-    return current_file.parents[2] / "data"
+from app.core.paths import get_data_folder, get_dataset_path
 
-
-def get_dataset_path(filename: str) -> Path:
-    """Resolve a dataset filename inside backend/data and verify it exists."""
-    if not filename:
-        raise ValueError("dataset filename cannot be empty")
-
-    dataset_path = get_data_folder() / filename
-    if not dataset_path.exists():
-        raise FileNotFoundError(
-            f"Dataset not found in backend/data. Expected file: {dataset_path}"
-        )
-
-    logger.info("Resolved dataset path: %s", dataset_path)
-    return dataset_path
 
 
 def load_dataset(filename: str, target_column: str, read_csv_kwargs: Dict[str, Any] = None) -> pd.DataFrame:
