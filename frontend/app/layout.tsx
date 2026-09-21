@@ -15,24 +15,13 @@ const jetbrainsMono = JetBrains_Mono({
 })
 
 export const metadata: Metadata = {
-  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'),
+  metadataBase: new URL(
+    process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'
+  ),
   title: 'Nexsure | AI Insurance Risk Intelligence',
-  description: 'Production-grade AI underwriting intelligence platform.',
-  keywords: [
-    'AI insurance',
-    'health insurance risk assessment',
-    'machine learning',
-    'SHAP explainability',
-    'Nexsure',
-  ],
-  authors: [{ name: 'Nexsure Engineering' }],
-  robots: 'index, follow',
-  openGraph: {
-    title: 'Nexsure | AI Insurance Risk Intelligence',
-    description: 'Production-grade AI underwriting intelligence platform.',
-    type: 'website',
-  },
+  description: 'Enterprise AI underwriting intelligence platform.',
 }
+
 
 export default function RootLayout({
   children,

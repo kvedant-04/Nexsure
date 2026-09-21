@@ -1,12 +1,11 @@
 /**
- * Nexsure API Client â€” v2.0
- * All endpoints use port 8000. No mixed ports, no 8001 references.
+ * Nexsure API Client — Enterprise Production & Development
  */
 
-const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000/api'
+export const API_BASE = (process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000').replace(/\/api\/?$/, '').replace(/\/$/, '')
+const API_BASE_URL = `${API_BASE}/api`
 
-// â”€â”€â”€ Response Interfaces â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─── Response Interfaces ──────────────────────────────────────────────────────
 
 export interface SystemInfoResponse {
   model_name:           string | null
@@ -388,14 +387,14 @@ async function apiRequest<T>(
       throw new APIError(
         0,
         err.message,
-        'Network error: Unable to reach Nexsure backend on port 8000.'
+        'Network error: Unable to reach Nexsure backend service.'
       )
     }
     throw new APIError(500, String(err), 'Unexpected error')
   }
 }
 
-// â”€â”€â”€ API Methods â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─── API Methods ──────────────────────────────────────────────────────────────
 
 export const api = {
   /** Real-time latency percentiles, throughput & timeline (Phase 3) */
@@ -469,18 +468,19 @@ export const api = {
     }),
 }
 
-// â”€â”€â”€ Utility â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─── Utility ──────────────────────────────────────────────────────────────────
 
 export function formatErrorMessage(error: unknown): string {
   if (error instanceof APIError) {
     if (error.statusCode === 0) {
-      return 'Connection failed â€” ensure the Nexsure backend is running on port 8000.'
+      return 'Connection failed — ensure the Nexsure backend is reachable and running.'
     }
     return error.details || error.message
   }
   if (error instanceof Error) return error.message
   return 'An unexpected error occurred.'
 }
+
 
 export function formatPercent(value: number | null | undefined, decimals = 1): string {
   if (value == null || Number.isNaN(value)) return 'Unavailable'
